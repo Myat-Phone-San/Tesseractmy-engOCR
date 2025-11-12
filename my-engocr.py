@@ -9,19 +9,13 @@ import re
 import pytesseract
 
 # --- Configuration and Initialization ---
-# Tesseract executable path (as provided by the user)
-# NOTE: This path is specific to your environment and must be correct for the code to run locally.
-TESSERACT_PATH = r"C:\Users\myatphonesan\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+# NOTE for Linux Deployment: We rely on the system-wide installation of tesseract
+# being in the PATH, thus TESSERACT_PATH and related configuration functions are removed.
 
 # TESSERACT_LANGUAGES: Set to 'eng+mya' to enable both English and Myanmar OCR
+# Ensure the user has installed 'tesseract-ocr-mya' or has configured Tesseract to
+# recognize 'mya' language data in the Linux environment.
 TESSERACT_LANGUAGES = 'eng+mya'
-
-def configure_tesseract():
-    """Sets the Tesseract command path."""
-    try:
-        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-    except Exception as e:
-        st.error(f"Error setting Tesseract path. Please check if Tesseract is installed at: {TESSERACT_PATH}. Error details: {e}")
 
 # Set the page configuration early
 st.set_page_config(
@@ -61,6 +55,7 @@ def extract_fields_by_region(image_array, active_regions):
     """ Extracts text for the specified fields using targeted regions defined by active_regions. """
     kv_data = {key: '-' for key in active_regions.keys()}
     H, W, _ = image_array.shape
+    # Create a copy for drawing bounding boxes (must be RGB for PIL/Streamlit image display later)
     img_boxes = cv2.cvtColor(image_array.copy(), cv2.COLOR_BGR2RGB)
 
     for key, (x_min_norm, y_min_norm, x_max_norm, y_max_norm) in active_regions.items():
@@ -72,22 +67,36 @@ def extract_fields_by_region(image_array, active_regions):
 
         # Crop and run Tesseract
         cropped_img = image_array[y_min:y_max, x_min:x_max]
-        if cropped_img.size == 0: continue
+        if cropped_img.size == 0: 
+            # Draw empty box if crop failed
+            cv2.rectangle(img_boxes, (x_min, y_min), (x_max, y_max), (0, 0, 255), 3) # Use Blue for failed crop
+            continue
         
-        text_raw = pytesseract.image_to_string(
-            cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB), 
-            lang=TESSERACT_LANGUAGES
-        ).strip()
-        
+        try:
+            # Convert BGR (OpenCV) to RGB (Tesseract/Pillow standard) for OCR
+            cropped_img_rgb = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB)
+            
+            text_raw = pytesseract.image_to_string(
+                cropped_img_rgb, 
+                lang=TESSERACT_LANGUAGES,
+                config='--psm 6' # Assume a single uniform block of text
+            ).strip()
+        except pytesseract.TesseractNotFoundError:
+            st.error("Tesseract is not installed or not in PATH. Check deployment configuration.")
+            text_raw = ""
+        except Exception as e:
+            st.warning(f"OCR failed for field '{key}': {e}")
+            text_raw = ""
+
         extracted_value = '-'
         if text_raw:
-            # Simplified value extraction logic
+            # Simple value extraction logic
             lines = [line.strip() for line in text_raw.split('\n') if line.strip()]
             
-            # Simple heuristic: look for key and take the following text
+            # Heuristic 1: Look for key and take the following text
             key_index = -1
             for i, line in enumerate(lines):
-                # Check for the key or the first word of the key
+                # Check for the key or the first word of the key (case-insensitive)
                 key_match_str = key.split(' ')[0].lower()
                 if key_match_str in line.lower(): 
                     key_index = i
@@ -98,9 +107,10 @@ def extract_fields_by_region(image_array, active_regions):
                 if value_lines:
                     extracted_value = " ".join(value_lines)
                 elif len(lines) == 1 and key.lower() in lines[0].lower():
-                    # Same line key-value handling
+                    # Heuristic 2: Same line key-value handling
                     key_end_index = lines[0].lower().find(key.lower()) + len(key)
-                    value_on_same_line = re.sub(r'[:\.\-\—]', '', lines[0][key_end_index:].strip()).strip()
+                    # Remove common delimiters and spaces from the start of the value
+                    value_on_same_line = re.sub(r'^\s*[:\.\-\—\s]', '', lines[0][key_end_index:].strip()).strip()
                     if value_on_same_line:
                         extracted_value = value_on_same_line
             
@@ -110,13 +120,21 @@ def extract_fields_by_region(image_array, active_regions):
 
         # Post-process specific fields (e.g., currency)
         if key == "Original Credit Amount" and extracted_value != '-':
-            amount_match = re.search(r'[\d\.\,]+', extracted_value.replace(' ', ''))
+            # Find common patterns for currency amounts (digits, dots, commas, optional currency code)
+            amount_match = re.search(r'([A-Z]{3,4}\s?)?([\d\.\,]+)', extracted_value.replace(' ', ''))
             if amount_match:
-                amount_str = amount_match.group(0).replace(',', '')
+                # Capture currency code (if present) and amount part
+                currency_code = amount_match.group(1).strip() if amount_match.group(1) else ''
+                amount_str = amount_match.group(2).replace(',', '')
                 try:
-                    extracted_value = f" {float(amount_str):,.2f}"
+                    # Attempt standard float conversion and formatting
+                    extracted_value = f"{currency_code} {float(amount_str):,.2f}"
                 except ValueError:
-                    extracted_value = f" {amount_str}"
+                    # If conversion fails, keep the raw matched string
+                    extracted_value = f"{currency_code} {amount_str}"
+            else:
+                # If no amount match, use the raw extracted text as a fallback
+                extracted_value = extracted_value.replace('\n', ' ').strip()
                 
         elif extracted_value != '-':
             extracted_value = extracted_value.replace('\n', ' ').strip()
@@ -137,13 +155,23 @@ def extract_fields_by_region(image_array, active_regions):
 def extract_full_text(image_array):
     """ Runs Tesseract on the entire image to get non-structured text. """
     with st.spinner("Extracting full page text (Non-Structured)..."):
-        full_text = pytesseract.image_to_string(
-            cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB),
-            lang=TESSERACT_LANGUAGES
-        ).strip()
-    return full_text
+        try:
+            # Convert BGR (OpenCV) to RGB (Tesseract/Pillow standard) for OCR
+            image_array_rgb = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
+            full_text = pytesseract.image_to_string(
+                image_array_rgb,
+                lang=TESSERACT_LANGUAGES
+            ).strip()
+            return full_text
+        except pytesseract.TesseractNotFoundError:
+            st.error("Tesseract is not installed or not in PATH. Cannot perform full text extraction.")
+            return "Error: Tesseract not found."
+        except Exception as e:
+            st.error(f"Error during full text extraction: {e}")
+            return f"Error: {e}"
 
-# --- Utility Functions (Modified) ---
+
+# --- Utility Functions ---
 def handle_file_upload(uploaded_file):
     """
     Handles file uploads, converting them to an OpenCV array and determining the file type.
@@ -157,6 +185,7 @@ def handle_file_upload(uploaded_file):
         if 'pdf' in file_type:
             file_type_str = 'pdf'
             with st.spinner("Converting PDF page 1 to image (150 DPI)..."):
+                # fitz (PyMuPDF) conversion logic
                 doc = fitz.open(stream=file_bytes, filetype="pdf")
                 if doc.page_count == 0:
                     st.error("Could not process PDF. The document is empty or unreadable.")
@@ -166,11 +195,14 @@ def handle_file_upload(uploaded_file):
                 zoom_factor = DPI / 72
                 matrix = fitz.Matrix(zoom_factor, zoom_factor)
                 pix = page.get_pixmap(matrix=matrix, alpha=False)
+                # Get image data buffer and reshape (pix.n is usually 3 for RGB)
                 img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                # Convert from RGB to BGR for OpenCV compatibility
                 img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
                 doc.close()
                 return img_array, file_type_str
         else:
+            # Image file decoding logic
             img_array = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
             return img_array, file_type_str
     except Exception as e:
@@ -179,18 +211,20 @@ def handle_file_upload(uploaded_file):
 
 def get_download_button(data, is_dataframe, file_format, label, file_name_base, help_text=""):
     """Generates a common download button for different formats."""
-    df = data
+    df = data if is_dataframe else None
+    data_out = None
+    mime = 'text/plain' 
+
     if file_format == 'csv' and is_dataframe:
         data_out = df.to_csv(index=False).encode('utf-8')
         mime = 'text/csv'
     elif file_format in ['txt', 'doc']:
         if is_dataframe:
             data_out = df.to_string(index=False).encode('utf-8')
-        else: # For non-structured text
+        else: # For non-structured text (string data)
             data_out = data.encode('utf-8')
         mime = 'text/plain' 
     else:
-        # Fallback for unexpected formats
         return 
 
     final_name = f'{file_name_base}.{file_format}'
@@ -204,11 +238,9 @@ def get_download_button(data, is_dataframe, file_format, label, file_name_base, 
 
 # --- Streamlit Application Layout ---
 def main():
-    # Configure Tesseract path first
-    configure_tesseract()
     
     st.title("🎯Document OCR Extractor (English & Myanmar)")
-    st.markdown("This tool uses **Tesseract OCR (eng+mya)** to extract specific fields and the full page text from a document.")
+    st.markdown("This tool uses **Tesseract OCR (eng+mya)** to extract specific fields and the full page text from a document. Ensure your deployment environment has Tesseract and the Myanmar language pack installed.")
 
     # 1. File Upload
     uploaded_file = st.file_uploader(
