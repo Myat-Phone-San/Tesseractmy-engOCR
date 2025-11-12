@@ -1,6 +1,7 @@
 tesseract-ocr
 tesseract-ocr-eng
 tesseract-ocr-mya
+libgl1
 libsm6
 libxext6
 libice6
