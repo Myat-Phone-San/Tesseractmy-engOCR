@@ -1,0 +1,5 @@
+tesseract-ocr
+libsm6
+libxext6
+libice6
+libglib2.0-0
