@@ -2,30 +2,23 @@ import cv2
 import numpy as np
 import pandas as pd
 import streamlit as st
-import fitz # PyMuPDF
 from PIL import Image
+from pdf2image import convert_from_bytes # Used as per common deployment practice for PDF handling
 import re
 import pytesseract
 import os
+import io
 
 # --- Configuration and Initialization ---
-# Tesseract executable path (as provided by the user)
-TESSERACT_PATH = r"C:\Users\myatphonesan\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
-
 # TESSERACT_LANGUAGES: Set to 'eng+mya' to enable both English and Myanmar OCR
+# In a cloud environment (like Streamlit Cloud), Tesseract must be installed 
+# and in the PATH. The fixed path and configure_tesseract() are removed 
+# as they are not valid for cross-system deployment.
 TESSERACT_LANGUAGES = 'eng+mya'
-
-def configure_tesseract():
-    """Sets the Tesseract command path."""
-    try:
-        pytesseract.pytesseract.tesseract_cmd = TESSERACT_PATH
-    except Exception as e:
-        st.error(f"Error setting Tesseract path. Please check if Tesseract is installed at: {TESSERACT_PATH}. Error details: {e}")
-        st.stop()
 
 # Set the page configuration early
 st.set_page_config(
-    page_title="Myanmar DL OCR Extractor (Final)",
+    page_title="Myanmar DL OCR Extractor (Deployment Ready)",
     layout="wide",
     initial_sidebar_state="expanded"
 )
@@ -58,14 +51,13 @@ def correct_aspect_rotation(image_array):
     
     # A standard driving license is a landscape (W > H) document.
     if H > W:
-        # Use an internal print/log instead of Streamlit info for a cleaner UI
         # print("Aspect ratio suggests Portrait (H > W). Rotating image 90 degrees clockwise to landscape.") 
         image_array = cv2.rotate(image_array, cv2.ROTATE_90_CLOCKWISE)
         
     return image_array
 
 # --- Perspective Correction (Deskew/Warp) ---
-def warp_document(image_array, display_status=False):
+def warp_document(image_array):
     """
     Finds the largest rectangular contour (the document) and performs 
     a perspective transformation to create a top-down, straightened view.
@@ -92,7 +84,7 @@ def warp_document(image_array, display_status=False):
             break
             
     if screenCnt is None:
-        # Return a warning message to the main logic instead of using st.warning here
+        # Return the original image and a warning
         return image_array, image_array, "Warping skipped: Document outline not found." 
 
     # 4. Perform Perspective Transformation 
@@ -128,6 +120,7 @@ def warp_document(image_array, display_status=False):
     warped = cv2.warpPerspective(image_array, M, (maxWidth, maxHeight))
     
     img_contour = image_array.copy()
+    # Draw contour with thicker line for visibility
     cv2.drawContours(img_contour, [screenCnt], -1, (0, 255, 0), 20) 
 
     return warped, img_contour, "Warping successful."
@@ -138,7 +131,7 @@ def extract_fields_by_region(image_array, active_regions):
     """ Extracts text for the specified fields using targeted regions defined by active_regions. """
     kv_data = {key: 'N/A' for key in active_regions.keys()}
     H, W, _ = image_array.shape
-    img_boxes = cv2.cvtColor(image_array.copy(), cv2.COLOR_BGR2RGB)
+    img_boxes = image_array.copy() # Use BGR copy for drawing
 
     for key, (x_min_norm, y_min_norm, x_max_norm, y_max_norm) in active_regions.items():
         x_min = int(x_min_norm * W / 1000)
@@ -149,9 +142,10 @@ def extract_fields_by_region(image_array, active_regions):
         cropped_img = image_array[y_min:y_max, x_min:x_max]
         if cropped_img.size == 0: continue
         
-        # Use PSM 7 for single line extraction of fields
+        # Use PSM 7 for single line extraction of fields (more focused)
         psm_config = '--psm 7' 
 
+        # Convert to RGB for pytesseract
         text_raw = pytesseract.image_to_string(
             cv2.cvtColor(cropped_img, cv2.COLOR_BGR2RGB), 
             lang=TESSERACT_LANGUAGES, 
@@ -160,28 +154,39 @@ def extract_fields_by_region(image_array, active_regions):
         
         extracted_value = 'N/A'
         if text_raw:
+            # Normalize whitespace
             extracted_value = re.sub(r'[\n\s]+', ' ', text_raw).strip()
 
             # Specific cleaning for NRC No.
             if key == "NRC No. (N.R.C No.)":
+                # Matches patterns like 12/KaTaKa(N)123456 or 12/KaMaNa(N)123456
+                # Handles both Burmese and English characters in the location part
+                # The regex is adjusted for common OCR errors (replacing space, backslash, etc. for initial match)
                 nrc_pattern = r'(\d+[\/\\-][a-zA-Z\s\u1000-\u109F]+[\(\[][a-zA-Z\s\u1000-\u109F]+[\)\]]\d+)'
-                nrc_match = re.search(nrc_pattern, extracted_value.replace(' ', ''))
+                # Clean up extracted_value before searching for the pattern
+                nrc_text_cleaned = extracted_value.replace(' ', '').replace('\\', '/').replace('-', '/')
+
+                nrc_match = re.search(nrc_pattern, nrc_text_cleaned)
                 if nrc_match:
+                    # Re-insert the proper slash after matching
                     extracted_value = nrc_match.group(1).replace('/', '/') 
                 else:
-                    extracted_value = extracted_value
+                    extracted_value = extracted_value # keep raw if pattern not found
             
             # Simple cleaning for date fields
             elif "Date" in key or "Valid" in key:
+                 # Remove non-date/non-separator characters
                  extracted_value = re.sub(r'[^\d\s\-\/]', '', extracted_value).strip()
 
 
         if extracted_value and extracted_value != 'N/A':
             kv_data[key] = extracted_value.strip()
 
-        cv2.rectangle(img_boxes, (x_min, y_min), (x_max, y_max), (255, 0, 0), 3)
+        # Draw box on the image (using BGR for cv2)
+        cv2.rectangle(img_boxes, (x_min, y_min), (x_max, y_max), (0, 0, 255), 3) # Blue box for emphasis
 
-    img_with_boxes = Image.fromarray(img_boxes)
+    # Convert final image with boxes from BGR to RGB for PIL/Streamlit display
+    img_with_boxes = Image.fromarray(cv2.cvtColor(img_boxes, cv2.COLOR_BGR2RGB))
     kv_df_list = [{'Key Label (Form Text)': k, 'Extracted Value': v} for k, v in kv_data.items()]
     df_kv_pairs = pd.DataFrame(kv_df_list)
     
@@ -191,6 +196,7 @@ def extract_fields_by_region(image_array, active_regions):
 def extract_full_text(image_array):
     """ Runs Tesseract on the entire image to get non-structured text using all configured languages. """
     with st.spinner("Extracting full page text (Non-Structured)..."):
+        # Convert to RGB for pytesseract
         full_text = pytesseract.image_to_string(
             cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB),
             lang=TESSERACT_LANGUAGES 
@@ -199,7 +205,10 @@ def extract_full_text(image_array):
 
 # --- Utility Functions (File Handling) ---
 def handle_file_upload(uploaded_file):
-    """ Handles file uploads, converting them to an OpenCV array. """
+    """ 
+    Handles file uploads, converting them to an OpenCV array.
+    Uses pdf2image for PDF conversion, suitable for cloud deployment.
+    """
     file_type = uploaded_file.type
     file_type_str = 'image'
     
@@ -207,63 +216,75 @@ def handle_file_upload(uploaded_file):
         file_bytes = uploaded_file.read()
         if 'pdf' in file_type:
             file_type_str = 'pdf'
-            with st.spinner("Converting PDF page 1 to image (150 DPI)..."):
-                doc = fitz.open(stream=file_bytes, filetype="pdf")
-                if doc.page_count == 0:
+            with st.spinner("Converting PDF page 1 to image (200 DPI)..."):
+                # Use pdf2image for conversion
+                images = convert_from_bytes(
+                    file_bytes, 
+                    dpi=200, 
+                    first_page=0, 
+                    last_page=1,
+                    fmt='jpeg' # Use a common format
+                )
+                if not images:
                     st.error("Could not process PDF. The document is empty or unreadable.")
                     return None, None
-                page = doc.load_page(0)
-                DPI = 150
-                zoom_factor = DPI / 72
-                matrix = fitz.Matrix(zoom_factor, zoom_factor)
-                pix = page.get_pixmap(matrix=matrix, alpha=False)
-                img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+                
+                # Convert the first PIL Image to a numpy array, then to BGR for OpenCV
+                img_pil = images[0]
+                img_array = np.array(img_pil.convert('RGB'))
                 img_array = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-                doc.close()
+
                 return img_array, file_type_str
         else:
+            # Handle standard image files
             img_array = cv2.imdecode(np.frombuffer(file_bytes, np.uint8), cv2.IMREAD_COLOR)
             return img_array, file_type_str
+            
     except Exception as e:
         st.error(f"Error loading file. Check if it's a valid Image or non-encrypted PDF. Error details: {e}")
         return None, None
 
 def get_download_button(data, is_dataframe, file_format, label, file_name_base, help_text=""):
     """Generates a common download button for different formats."""
+    data_out = None
+    mime = 'text/plain' 
+    final_name = f'{file_name_base}.{file_format}'
     df = data
+
     if file_format == 'csv' and is_dataframe:
         data_out = df.to_csv(index=False).encode('utf-8')
         mime = 'text/csv'
     elif file_format in ['txt', 'doc']:
         if is_dataframe:
-            data_out = df.to_string(index=False).encode('utf-8')
+            # Format DataFrame nicely for text file
+            text_output = ""
+            for index, row in df.iterrows():
+                text_output += f"{row['Key Label (Form Text)']}: {row['Extracted Value']}\n"
+            data_out = text_output.encode('utf-8')
         else: # For non-structured text
             data_out = data.encode('utf-8')
-        mime = 'text/plain' 
-    else:
-        return 
+        # mime is kept as 'text/plain' even for .doc as it's a simple text-based download
 
-    final_name = f'{file_name_base}.{file_format}'
-    st.download_button(
-        label=label,
-        data=data_out,
-        file_name=final_name,
-        mime=mime,
-        help=help_text
-    )
+    if data_out is not None:
+        st.download_button(
+            label=label,
+            data=data_out,
+            file_name=final_name,
+            mime=mime,
+            help=help_text
+        )
 
 # --- Streamlit Application Layout ---
 def main():
-    # Configure Tesseract path first
-    configure_tesseract()
     
-    st.title("Myanmar Driving License OCR Extractor")
-
+    st.title("🇲🇲 Myanmar Driving License OCR Extractor (Deployment Ready)")
+    st.info("This application is configured for cloud deployment (e.g., Streamlit Cloud) using system packages for Tesseract and Poppler.")
+    
     # 1. File Upload
     uploaded_file = st.file_uploader(
-        "Choose a Document File (Image or PDF)",
+        "**1. Upload Document File (Image or PDF)**",
         type=['jpg', 'jpeg', 'png', 'pdf'],
-        help="For multi-page PDFs, only the first page will be processed."
+        help="For multi-page PDFs, only the first page will be processed. Ensure the image is clear and the document is not heavily obscured."
     )
     st.markdown("---")
 
@@ -271,76 +292,75 @@ def main():
     file_type = None
     
     if uploaded_file is not None:
-        # Removed st.info() about file upload
-        image_array, file_type = handle_file_upload(uploaded_file)
+        with st.spinner(f"Loading {uploaded_file.type.split('/')[-1]}..."):
+            image_array, file_type = handle_file_upload(uploaded_file)
 
     # --- OCR Processing and Results Display ---
     if image_array is not None and file_type is not None:
         
-        st.subheader("2. Preprocessing: Rotation and Perspective Correction")
+        st.subheader("2. Preprocessing & Perspective Correction")
         
         # 2. Correct 90/270 rotation based on Aspect Ratio (Ensures Landscape)
         rotated_image = correct_aspect_rotation(image_array.copy())
         
         # 3. Perspective Warp (Deskew)
-        # The third return value captures the status/warning message
-        warped_image, image_with_contour, warp_status = warp_document(rotated_image)
+        with st.spinner("Applying perspective correction..."):
+            warped_image, image_with_contour, warp_status = warp_document(rotated_image)
         
         # Display warp status/warning only if it's not a success message
         if "Warping skipped" in warp_status:
-             st.warning(warp_status)
+              st.warning(warp_status + " Proceeding with the rotated image.")
 
         # Run extractions on the fully corrected image
         df_kv_pairs, img_with_boxes = extract_fields_by_region(warped_image, TARGET_FIELD_REGIONS)
         full_text = extract_full_text(warped_image)
 
+        # Display Images
         col_contour, col_warped = st.columns(2)
         
         with col_contour:
-             st.markdown("### 🖼️ Document after Aspect Rotation (Outline Detected)")
-             # Used use_container_width=True to remove the warning
-             st.image(cv2.cvtColor(image_with_contour, cv2.COLOR_BGR2RGB), caption="Document after rotation correction. Detected Outline (Green)", use_container_width=True)
-             
+            st.markdown("#### 🖼️ Document Outline Detection")
+            # Convert BGR to RGB for Streamlit display
+            img_rgb_contour = cv2.cvtColor(image_with_contour, cv2.COLOR_BGR2RGB)
+            st.image(img_rgb_contour, caption="Detected Outline (Green).", use_container_width=True)
+            
         with col_warped:
-            st.markdown("### 📐 Final Warped Image with Extracted Regions")
-             # Used use_container_width=True to remove the warning
-            st.image(img_with_boxes, caption="Document after full correction (Red Boxes = Fixed Regions Applied)", use_container_width=True)
-
+            st.markdown("#### 📐 Final Warped Image for OCR")
+            # img_with_boxes is already RGB (PIL Image)
+            st.image(img_with_boxes, caption="Fixed Regions Applied (Red Boxes).", use_container_width=True)
 
         st.markdown("---")
         
         st.subheader("3. OCR Extraction Results")
 
         # Results Display
-        tab_structured, tab_non_structured = st.tabs(["📄 Structured Table", "📋 All Non-Structured Text"])
+        tab_structured, tab_non_structured = st.tabs(["📄 Structured Key-Value Pairs", "📋 Full Non-Structured Text"])
 
         with tab_structured:
-            st.markdown("### 🔑 Extracted Key-Value Pairs")
+            st.markdown("### Extracted Fields using Fixed Regions")
             st.dataframe(
                 df_kv_pairs[['Key Label (Form Text)', 'Extracted Value']], 
                 use_container_width=True, 
                 hide_index=True
             )
             
-            st.markdown("#### Download Options (Table)")
-            col_csv, col_txt, col_word = st.columns(3)
+            st.markdown("#### Download Table Data")
+            col_csv, col_txt, _ = st.columns(3)
             with col_csv:
                 get_download_button(df_kv_pairs, True, 'csv', "📥 Download CSV", 'dl_extracted_key_value_pairs')
             with col_txt:
                 get_download_button(df_kv_pairs, True, 'txt', "📥 Download TXT", 'dl_extracted_key_value_pairs')
-            with col_word:
-                get_download_button(df_kv_pairs, True, 'doc', "📥 Download DOC", 'dl_extracted_key_value_pairs', help_text="Saves the table data as a text file with a .doc extension.")
         
         with tab_non_structured:
-            st.markdown("### Full Extracted Text (Eng + Mya) from Warped Document")
+            st.markdown("### Raw OCR Output (Eng + Mya)")
             st.text_area(
                 label="Non-Structured Text",
                 value=full_text,
                 height=400,
-                help="This is the raw text output from Tesseract using both English and Myanmar languages, extracted from the corrected image."
+                help="Raw text output from the entire corrected image, useful for debugging."
             )
             
-            st.markdown("#### Download Options (Full Text)")
+            st.markdown("#### Download Full Text")
             col_txt_full, col_word_full, _ = st.columns(3)
             with col_txt_full:
                 get_download_button(full_text, False, 'txt', "📥 Download TXT", 'dl_full_extracted_text')
